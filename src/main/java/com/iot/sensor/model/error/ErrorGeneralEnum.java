@@ -16,7 +16,8 @@ public enum ErrorGeneralEnum {
     ERROR_NOT_FOUND("200007", "No encontrado", 404),
     ERROR_NO_MEASUREMENTS("200008", "Sin mediciones", 404),
     ERROR_VALIDATION("200009", "Error de validación en request body", 400),
-    ERROR_INTERNAL("200010", "Error interno del servidor", 500);
+    ERROR_INTERNAL("200010", "Error interno del servidor", 500),
+    ERROR_DEVICE_ID_FORMAT("200011", "Formato de device_id inválido", 400);
 
     private final String errorCode;
     private final String message;

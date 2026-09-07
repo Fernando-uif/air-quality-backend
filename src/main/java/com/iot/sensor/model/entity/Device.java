@@ -70,5 +70,10 @@ public class Device {
         private Integer adc;
         private Integer gpio;
         private String label;
+        // Estado del sensor (robustez): "ok" | "error".
+        // Se persiste dentro del JSON del atributo "sensors" (sin cambio de schema DynamoDB).
+        private String status;
+        private Long since;    // epoch (s) desde que está en el estado actual
+        private Long lastSeen; // epoch (s) de la última vez que se recibió dato de este sensor
     }
 }

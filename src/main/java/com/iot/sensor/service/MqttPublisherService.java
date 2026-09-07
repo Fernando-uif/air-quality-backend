@@ -24,6 +24,7 @@ public class MqttPublisherService {
     private final ObjectMapper objectMapper;
 
     private static final String COMMAND_TOPIC_TEMPLATE = "devices/%s/command";
+    private static final String REGISTER_ACK_TOPIC_TEMPLATE = "devices/%s/register/ack";
 
     /**
      * Envía comando de medición inmediata a un dispositivo.
@@ -38,6 +39,23 @@ public class MqttPublisherService {
 
         publish(topic, command);
         log.info("MQTT comando enviado a {}: measure_now", deviceId);
+    }
+
+    /**
+     * Responde al registro del dispositivo con la hora del servidor (calibración de reloj).
+     * Topic: devices/{device_id}/register/ack
+     * El micro usa server_time para calcular su offset (no depende de NTP ni RTC).
+     */
+    public void sendRegisterAck(String deviceId) {
+        String topic = String.format(REGISTER_ACK_TOPIC_TEMPLATE, deviceId);
+
+        Map<String, Object> ack = Map.of(
+                "action", "time_sync",
+                "server_time", java.time.Instant.now().getEpochSecond()
+        );
+
+        publish(topic, ack);
+        log.info("MQTT ACK de registro enviado a {}: time_sync", deviceId);
     }
 
     /**

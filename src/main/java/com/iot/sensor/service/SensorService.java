@@ -25,9 +25,20 @@ public class SensorService {
     private final DeviceRepository deviceRepository;
     private final MeasurementRepository measurementRepository;
     private final HmacService hmacService;
+    private final MqttPublisherService mqttPublisherService;
 
     @org.springframework.beans.factory.annotation.Value("${security.registration-key}")
     private String registrationKey;
+
+    // Formato esperado de device_id: PICO-{codigoPais 2-3 letras}-{numero}. Ej: PICO-MX-1
+    private static final java.util.regex.Pattern DEVICE_ID_PATTERN =
+            java.util.regex.Pattern.compile("^PICO-[A-Z]{2,3}-\\d+$");
+
+    /** Señal de fallo enviada por el micro: value==0 && raw_value==0 (sin flag nuevo ni cambio de firma). */
+    private static boolean isSensorFault(MeasurementRequestDto.ReadingDto r) {
+        return r.getValue() != null && r.getValue() == 0.0
+                && r.getRawValue() != null && r.getRawValue() == 0;
+    }
 
     // ============================================================
     // POST /measurements
@@ -59,7 +70,7 @@ public class SensorService {
                     String.format("Sequence %d no es mayor a %d (replay?)", request.getSequence(), lastSeq));
         }
 
-        // 5. HMAC — firma sobre readings concatenados
+        // 5. HMAC — firma sobre readings concatenados (payload COMPLETO recibido, incluidos fallos 0/0)
         if (!hmacService.verifySignatureMulti(
                 device.getSecretKey(),
                 request.getDeviceId(),
@@ -70,30 +81,73 @@ public class SensorService {
             throw new GeneralException(ErrorGeneralEnum.ERROR_SIGNATURE_INVALID);
         }
 
-        // 6. Mapear readings con info del sensor (type, unit)
+        long now = Instant.now().getEpochSecond();
+
+        // 6. Config de sensores del device (mapa por id) para type/unit y estado
         Map<String, Device.SensorConfig> sensorMap = new HashMap<>();
         if (device.getSensors() != null) {
             device.getSensors().forEach(s -> sensorMap.put(s.getId(), s));
         }
 
-        List<Measurement.Reading> readings = request.getReadings().stream()
-                .map(r -> {
-                    Device.SensorConfig cfg = sensorMap.get(r.getSensorId());
-                    return Measurement.Reading.builder()
-                            .sensorId(r.getSensorId())
-                            .type(cfg != null ? cfg.getType() : "unknown")
-                            .unit(cfg != null ? cfg.getUnit() : "?")
-                            .value(r.getValue())
-                            .rawValue(r.getRawValue())
-                            .build();
-                })
-                .collect(Collectors.toList());
+        // 6.1 Separar readings válidos de los que llegan en fallo (señal 0/0 puesta por el micro)
+        //     La detección física (rango, 10 muestras, DHT11) es del MICRO; el backend solo lee la señal.
+        List<Measurement.Reading> validReadings = new ArrayList<>();
+        boolean deviceStateChanged = false;
 
-        // 7. Guardar medición
+        for (MeasurementRequestDto.ReadingDto r : request.getReadings()) {
+            Device.SensorConfig cfg = sensorMap.get(r.getSensorId());
+            boolean fault = isSensorFault(r);
+
+            // Actualizar estado por sensor con transiciones (protección de fallos consecutivos)
+            if (cfg != null) {
+                cfg.setLastSeen(now);
+                String prev = cfg.getStatus() == null ? "ok" : cfg.getStatus();
+                String next = fault ? "error" : "ok";
+                if (!prev.equals(next)) {
+                    cfg.setStatus(next);
+                    cfg.setSince(now);
+                    deviceStateChanged = true;
+                    log.info("Sensor {} de {} transición {}→{}", r.getSensorId(),
+                            request.getDeviceId(), prev, next);
+                }
+            }
+
+            if (!fault) {
+                validReadings.add(Measurement.Reading.builder()
+                        .sensorId(r.getSensorId())
+                        .type(cfg != null ? cfg.getType() : "unknown")
+                        .unit(cfg != null ? cfg.getUnit() : "?")
+                        .value(r.getValue())
+                        .rawValue(r.getRawValue())
+                        .build());
+            }
+        }
+
+        // 7. Persistir estado del device solo si hubo transición (evita escrituras redundantes)
+        if (deviceStateChanged) {
+            deviceRepository.save(device);
+        }
+
+        // 7.1 Si TODOS los sensores están en fallo → no hay dato útil: no se guarda medición
+        if (validReadings.isEmpty()) {
+            log.info("Medición NO guardada (todos los sensores en fallo): device={}, seq={}",
+                    request.getDeviceId(), request.getSequence());
+            return ApiResponseDto.builder()
+                    .success(true)
+                    .message("Sin sensores válidos: solo se actualizó el estado")
+                    .data(Map.of(
+                            "device_id", request.getDeviceId(),
+                            "sensors", 0,
+                            "sequence", request.getSequence()
+                    ))
+                    .build();
+        }
+
+        // 8. Guardar medición SOLO con readings válidos (histórico limpio, sin ceros de fallo)
         Measurement measurement = Measurement.builder()
                 .deviceId(request.getDeviceId())
                 .timestamp(request.getTimestamp())
-                .readings(readings)
+                .readings(validReadings)
                 .sequence(request.getSequence())
                 .country(safe(device.getCountry()))
                 .state(safe(device.getState()))
@@ -106,14 +160,14 @@ public class SensorService {
         deviceRepository.updateLastSequence(request.getDeviceId(), request.getSequence());
 
         log.info("Medición registrada: device={}, sensors={}, seq={}",
-                request.getDeviceId(), readings.size(), request.getSequence());
+                request.getDeviceId(), validReadings.size(), request.getSequence());
 
         return ApiResponseDto.builder()
                 .success(true)
                 .message("Medición registrada")
                 .data(Map.of(
                         "device_id", request.getDeviceId(),
-                        "sensors", readings.size(),
+                        "sensors", validReadings.size(),
                         "sequence", request.getSequence()
                 ))
                 .build();
@@ -132,61 +186,69 @@ public class SensorService {
      * o ser conocida por ambas partes (pre-shared key).
      */
     public void autoRegisterDevice(DeviceAutoRegisterDto request) {
-        // 1. Verificar timestamp (no aceptar registros viejos)
-        if (!hmacService.verifyTimestamp(request.getTimestamp())) {
-            throw new GeneralException(ErrorGeneralEnum.ERROR_TIMESTAMP_INVALID);
+        // 1. Validar formato de device_id (PICO-XX-N). NO se valida timestamp en el registro:
+        //    el micro arranca con reloj basura y necesita registrarse para recibir la hora (ACK).
+        if (request.getDeviceId() == null || !DEVICE_ID_PATTERN.matcher(request.getDeviceId()).matches()) {
+            throw new GeneralException(ErrorGeneralEnum.ERROR_DEVICE_ID_FORMAT);
         }
 
-        // 2. Verificar firma: HMAC(secret_key, device_id:timestamp)
-        // La secret_key la debe conocer el backend para validar
-        // Se busca si ya existe el device (re-registro) o se usa la key del payload firmado
-        String expectedMessage = request.getDeviceId() + ":" + request.getTimestamp();
+        long now = Instant.now().getEpochSecond();
 
         // Buscar si ya existe
         Optional<Device> existing = deviceRepository.findById(request.getDeviceId());
         if (existing.isPresent()) {
             // Ya registrado — verificar firma con la key que ya tiene
             Device device = existing.get();
-            String expected = hmacService.generateSignature(
-                    device.getSecretKey(), request.getDeviceId(),
-                    (double) request.getTimestamp(), request.getTimestamp(), 0L);
 
             if (!hmacService.verifyAutoRegisterSignature(device.getSecretKey(),
                     request.getDeviceId(), request.getTimestamp(), request.getSignature())) {
                 throw new GeneralException(ErrorGeneralEnum.ERROR_SIGNATURE_INVALID);
             }
 
-            // Actualizar info (ubicación, sensores pueden haber cambiado)
+            // Actualizar info (ubicación, sensores pueden haber cambiado).
+            // Preservar estado de sensores existente cuando el id coincide.
+            Map<String, Device.SensorConfig> prevStatus = new HashMap<>();
+            if (device.getSensors() != null) {
+                device.getSensors().forEach(s -> prevStatus.put(s.getId(), s));
+            }
+
             device.setCountry(request.getCountry());
             device.setState(request.getState());
             device.setMunicipality(request.getMunicipality());
             device.setLatitude(request.getLatitude());
             device.setLongitude(request.getLongitude());
             device.setSensors(request.getSensors().stream()
-                    .map(s -> Device.SensorConfig.builder()
-                            .id(s.getId()).type(s.getType()).unit(s.getUnit())
-                            .adc(s.getAdc()).gpio(s.getGpio()).label(s.getLabel())
-                            .build())
+                    .map(s -> {
+                        Device.SensorConfig old = prevStatus.get(s.getId());
+                        return Device.SensorConfig.builder()
+                                .id(s.getId()).type(s.getType()).unit(s.getUnit())
+                                .adc(s.getAdc()).gpio(s.getGpio()).label(s.getLabel())
+                                .status(old != null && old.getStatus() != null ? old.getStatus() : "ok")
+                                .since(old != null && old.getSince() != null ? old.getSince() : now)
+                                .lastSeen(old != null ? old.getLastSeen() : now)
+                                .build();
+                    })
                     .collect(Collectors.toList()));
             device.setActive(true);
             deviceRepository.save(device);
 
             log.info("Dispositivo re-registrado via MQTT: {}", request.getDeviceId());
+            mqttPublisherService.sendRegisterAck(request.getDeviceId());
             return;
         }
 
-        // 3. Nuevo dispositivo — la secret_key viene implícita en la firma
-        // Para validar, usamos la REGISTRATION_KEY (shared secret del sistema)
+        // 3. Nuevo dispositivo — validar firma con la REGISTRATION_KEY (shared secret del sistema)
         if (!hmacService.verifyAutoRegisterSignature(registrationKey,
                 request.getDeviceId(), request.getTimestamp(), request.getSignature())) {
             throw new GeneralException(ErrorGeneralEnum.ERROR_SIGNATURE_INVALID);
         }
 
-        // 4. Registrar
+        // 4. Registrar (inicializar estado de cada sensor en "ok")
         List<Device.SensorConfig> sensors = request.getSensors().stream()
                 .map(s -> Device.SensorConfig.builder()
                         .id(s.getId()).type(s.getType()).unit(s.getUnit())
                         .adc(s.getAdc()).gpio(s.getGpio()).label(s.getLabel())
+                        .status("ok").since(now).lastSeen(now)
                         .build())
                 .collect(Collectors.toList());
 
@@ -201,12 +263,13 @@ public class SensorService {
                 .secretKey(registrationKey)
                 .active(true)
                 .lastSequence(0L)
-                .registeredAt(Instant.now().getEpochSecond())
+                .registeredAt(now)
                 .build();
 
         deviceRepository.save(device);
         log.info("Dispositivo auto-registrado via MQTT: {} con {} sensores",
                 request.getDeviceId(), sensors.size());
+        mqttPublisherService.sendRegisterAck(request.getDeviceId());
     }
 
     // ============================================================
